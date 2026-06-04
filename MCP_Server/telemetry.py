@@ -84,7 +84,7 @@ class TelemetryEvent:
 
 
 # Global consent flag - can be set via environment variable
-_user_consent: bool = True  # TODO: Implement proper consent UI, defaulting to True for testing
+_user_consent: bool = True
 
 
 def set_telemetry_consent(consent: bool):

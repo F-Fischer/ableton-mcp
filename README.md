@@ -15,7 +15,7 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 - **Clip creation**: Create and edit MIDI clips with notes
 - **Arrangement view composition**: Build full songs autonomously in Arrangement View, including sections like intro, buildup, drop, breakdown, and outro
 - **Session control**: Start and stop playback, fire clips, and control transport across Session View and Arrangement View
-- **Anonymous telemetry**: Opt-in usage tracking to help improve the tool
+- **Anonymous telemetry**: Usage tracking to help improve the tool (can be disabled)
 
 ## Components
 
@@ -175,6 +175,43 @@ The system uses a simple JSON-based protocol over TCP sockets:
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Telemetry
+
+AbletonMCP collects anonymous usage data to help improve the tool. This includes:
+- Tool usage statistics (which features are used)
+- Session information (for daily/monthly active user counts)
+- Error rates and performance metrics
+
+No personal information, project names, or audio content is collected.
+
+### Opting Out
+
+To disable telemetry, set one of these environment variables before starting the MCP server:
+
+```bash
+export ABLETON_MCP_DISABLE_TELEMETRY=true
+```
+
+Or use any of these alternatives:
+- `DISABLE_TELEMETRY=true`
+- `MCP_DISABLE_TELEMETRY=true`
+
+For Claude Desktop, add the environment variable to your config:
+
+```json
+{
+    "mcpServers": {
+        "AbletonMCP": {
+            "command": "uvx",
+            "args": ["ableton-mcp"],
+            "env": {
+                "ABLETON_MCP_DISABLE_TELEMETRY": "true"
+            }
+        }
+    }
+}
+```
 
 ## Disclaimer
 
