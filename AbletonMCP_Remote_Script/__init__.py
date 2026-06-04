@@ -897,42 +897,93 @@ class AbletonMCP(ControlSurface):
             self.log_message(traceback.format_exc())
             raise
     
+    # Substring markers that point a URI at a likely root. If no marker
+    # matches we fall back to the default order, so this is purely an
+    # optimisation — never a correctness change.
+    _URI_ROOT_HINTS = (
+        ('plugins',       ('vst:', 'vst3:', 'au:', 'query:plugins', 'plugin#')),
+        ('max_for_live',  ('max for live', 'maxforlive', 'm4l', 'query:max')),
+        ('user_library',  ('user library', 'userlibrary', 'query:user library', 'query:user-library')),
+        ('packs',         ('query:packs', '/packs/')),
+        ('samples',       ('query:samples', 'sample:', '/samples/')),
+        ('drums',         ('query:drums', '/drums/')),
+        ('instruments',   ('query:instruments', '/instruments/')),
+        ('sounds',        ('query:sounds', '/sounds/')),
+        ('audio_effects', ('query:audio effects', 'audioeffects', '/audio_effects/')),
+        ('midi_effects',  ('query:midi effects', 'midieffects', '/midi_effects/')),
+    )
+
+    def _order_roots_by_uri(self, roots, uri):
+        """Reorder ``roots`` so the URI's likely root is walked first."""
+        if not isinstance(uri, (bytes, str)) or not uri:
+            return roots
+        lowered = uri.lower()
+        for attr, markers in self._URI_ROOT_HINTS:
+            if any(m in lowered for m in markers):
+                head = [(a, r) for (a, r) in roots if a == attr]
+                tail = [(a, r) for (a, r) in roots if a != attr]
+                return head + tail
+        return roots
+
     def _find_browser_item_by_uri(self, browser_or_item, uri, max_depth=10, current_depth=0):
-        """Find a browser item by its URI"""
+        """Find a browser item by its URI.
+
+        Top-level lookups are memoised on ``self._uri_cache`` so repeated
+        loads of the same URI don't re-walk the entire browser tree.
+        """
+        if current_depth == 0:
+            cache = getattr(self, '_uri_cache', None)
+            if cache is None:
+                self._uri_cache = cache = {}
+            if uri in cache:
+                return cache[uri]
+            result = self._walk_browser_for_uri(browser_or_item, uri, max_depth, 0)
+            if result is not None:
+                cache[uri] = result
+            return result
+        return self._walk_browser_for_uri(browser_or_item, uri, max_depth, current_depth)
+
+    def _walk_browser_for_uri(self, browser_or_item, uri, max_depth, current_depth):
+        """Recursive walk used by :py:meth:`_find_browser_item_by_uri`."""
         try:
             # Check if this is the item we're looking for
             if hasattr(browser_or_item, 'uri') and browser_or_item.uri == uri:
                 return browser_or_item
-            
+
             # Stop recursion if we've reached max depth
             if current_depth >= max_depth:
                 return None
-            
+
             # Check if this is a browser with root categories
             if hasattr(browser_or_item, 'instruments'):
-                # Check all main categories
-                categories = [
-                    browser_or_item.instruments,
-                    browser_or_item.sounds,
-                    browser_or_item.drums,
-                    browser_or_item.audio_effects,
-                    browser_or_item.midi_effects
+                roots = [
+                    ('instruments', browser_or_item.instruments),
+                    ('sounds', browser_or_item.sounds),
+                    ('drums', browser_or_item.drums),
+                    ('audio_effects', browser_or_item.audio_effects),
+                    ('midi_effects', browser_or_item.midi_effects),
                 ]
-                
-                for category in categories:
+                for extra_attr in ('plugins', 'max_for_live', 'user_library', 'packs', 'samples'):
+                    if hasattr(browser_or_item, extra_attr):
+                        try:
+                            roots.append((extra_attr, getattr(browser_or_item, extra_attr)))
+                        except (AttributeError, RuntimeError) as e:
+                            self.log_message("Could not access browser.{0}: {1}".format(extra_attr, str(e)))
+
+                for _attr, category in self._order_roots_by_uri(roots, uri):
                     item = self._find_browser_item_by_uri(category, uri, max_depth, current_depth + 1)
                     if item:
                         return item
-                
+
                 return None
-            
+
             # Check if this item has children
             if hasattr(browser_or_item, 'children') and browser_or_item.children:
                 for child in browser_or_item.children:
                     item = self._find_browser_item_by_uri(child, uri, max_depth, current_depth + 1)
                     if item:
                         return item
-            
+
             return None
         except Exception as e:
             self.log_message("Error finding browser item by URI: {0}".format(str(e)))
