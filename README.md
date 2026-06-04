@@ -1,7 +1,7 @@
 # AbletonMCP - Ableton Live Model Context Protocol Integration
 [![smithery badge](https://smithery.ai/badge/@ahujasid/ableton-mcp)](https://smithery.ai/server/@ahujasid/ableton-mcp)
 
-AbletonMCP connects Ableton Live to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Ableton Live. This integration enables prompt-assisted music production, track creation, and Live session manipulation.
+AbletonMCP connects Ableton Live to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Ableton Live. This integration enables prompt-assisted music production, end-to-end track creation, and Live session and arrangement manipulation.
 
 ### Join the Community
 
@@ -13,7 +13,8 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 - **Track manipulation**: Create, modify, and manipulate MIDI and audio tracks
 - **Instrument and effect selection**: Claude can access and load the right instruments, effects and sounds from Ableton's library
 - **Clip creation**: Create and edit MIDI clips with notes
-- **Session control**: Start and stop playback, fire clips, and control transport
+- **Arrangement view composition**: Build full songs autonomously in Arrangement View, including sections like intro, buildup, drop, breakdown, and outro
+- **Session control**: Start and stop playback, fire clips, and control transport across Session View and Arrangement View
 
 ## Components
 
@@ -125,6 +126,7 @@ Once the config file has been set on Claude, and the remote script is running in
 
 - Get session and track information
 - Create and modify MIDI and audio tracks
+- Create full song arrangements from start to finish in Arrangement View
 - Create, edit, and trigger clips
 - Control playback
 - Load instruments and effects from Ableton's browser
@@ -137,6 +139,7 @@ Here are some examples of what you can ask Claude to do:
 
 - "Create an 80s synthwave track" [Demo](https://youtu.be/VH9g66e42XA)
 - "Create a Metro Boomin style hip-hop beat"
+- "Create a full arrangement with an intro, buildup, drop, breakdown, and outro"
 - "Create a new MIDI track with a synth bass instrument"
 - "Add reverb to my drums"
 - "Create a 4-bar MIDI clip with a simple melody"

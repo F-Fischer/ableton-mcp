@@ -3,9 +3,13 @@ from mcp.server.fastmcp import FastMCP, Context
 import socket
 import json
 import logging
+import os
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union
+
+ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
+ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -22,14 +26,16 @@ class AbletonConnection:
         """Connect to the Ableton Remote Script socket server"""
         if self.sock:
             return True
-            
+
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5.0)
             self.sock.connect((self.host, self.port))
+            self.sock.settimeout(None)
             logger.info(f"Connected to Ableton at {self.host}:{self.port}")
             return True
         except Exception as e:
-            logger.error(f"Failed to connect to Ableton: {str(e)}")
+            logger.error(f"Failed to connect to Ableton at {self.host}:{self.port}: {str(e)}")
             self.sock = None
             return False
     
@@ -105,7 +111,10 @@ class AbletonConnection:
             "create_midi_track", "create_audio_track", "set_track_name",
             "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "start_playback", "stop_playback", "load_instrument_or_effect"
+            "start_playback", "stop_playback", "load_instrument_or_effect",
+            # Arrangement view commands
+            "switch_to_arrangement_view", "set_current_song_time",
+            "duplicate_session_clip_to_arrangement"
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -121,34 +130,24 @@ class AbletonConnection:
             self.sock.sendall(json.dumps(command).encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
             
-            # For state-modifying commands, add a small delay to give Ableton time to process
-            if is_modifying_command:
-                import time
-                time.sleep(0.1)  # 100ms delay
-            
             # Set timeout based on command type
             if command_type in long_running_commands:
                 timeout = long_running_commands[command_type]
             else:
                 timeout = 15.0 if is_modifying_command else 10.0
             self.sock.settimeout(timeout)
-            
+
             # Receive the response
             response_data = self.receive_full_response(self.sock)
             logger.info(f"Received {len(response_data)} bytes of data")
-            
+
             # Parse the response
             response = json.loads(response_data.decode('utf-8'))
             logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
+
             if response.get("status") == "error":
                 logger.error(f"Ableton error: {response.get('message')}")
                 raise Exception(response.get("message", "Unknown error from Ableton"))
-            
-            # For state-modifying commands, add another small delay after receiving response
-            if is_modifying_command:
-                import time
-                time.sleep(0.1)  # 100ms delay
             
             return response.get("result", {})
         except socket.timeout:
@@ -204,14 +203,21 @@ _ableton_connection = None
 def get_ableton_connection():
     """Get or create a persistent Ableton connection"""
     global _ableton_connection
-    
-    if _ableton_connection is not None:
+
+    if _ableton_connection is not None and _ableton_connection.sock is not None:
         try:
-            # Test the connection with a simple ping
-            # We'll try to send an empty message, which should fail if the connection is dead
-            # but won't affect Ableton if it's alive
-            _ableton_connection.sock.settimeout(1.0)
-            _ableton_connection.sock.sendall(b'')
+            # Check if the socket is still alive by peeking for data
+            # MSG_PEEK + MSG_DONTWAIT will raise BlockingIOError if alive but no data,
+            # or return b'' if the remote end has closed the connection.
+            _ableton_connection.sock.setblocking(False)
+            try:
+                data = _ableton_connection.sock.recv(1, socket.MSG_PEEK)
+                if data == b'':
+                    raise ConnectionError("Remote end closed")
+            except BlockingIOError:
+                pass  # Socket is alive, just no data waiting — this is normal
+            finally:
+                _ableton_connection.sock.setblocking(True)
             return _ableton_connection
         except Exception as e:
             logger.warning(f"Existing connection is no longer valid: {str(e)}")
@@ -223,26 +229,14 @@ def get_ableton_connection():
     
     # Connection doesn't exist or is invalid, create a new one
     if _ableton_connection is None:
-        # Try to connect up to 3 times with a short delay between attempts
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
-                logger.info(f"Connecting to Ableton (attempt {attempt}/{max_attempts})...")
-                _ableton_connection = AbletonConnection(host="localhost", port=9877)
+                logger.info(f"Connecting to Ableton at {ABLETON_HOST}:{ABLETON_PORT} (attempt {attempt}/{max_attempts})...")
+                _ableton_connection = AbletonConnection(host=ABLETON_HOST, port=ABLETON_PORT)
                 if _ableton_connection.connect():
                     logger.info("Created new persistent connection to Ableton")
-                    
-                    # Validate connection with a simple command
-                    try:
-                        # Get session info as a test
-                        _ableton_connection.send_command("get_session_info")
-                        logger.info("Connection validated successfully")
-                        return _ableton_connection
-                    except Exception as e:
-                        logger.error(f"Connection validation failed: {str(e)}")
-                        _ableton_connection.disconnect()
-                        _ableton_connection = None
-                        # Continue to next attempt
+                    return _ableton_connection
                 else:
                     _ableton_connection = None
             except Exception as e:
@@ -250,8 +244,7 @@ def get_ableton_connection():
                 if _ableton_connection:
                     _ableton_connection.disconnect()
                     _ableton_connection = None
-            
-            # Wait before trying again, but only if we have more attempts left
+
             if attempt < max_attempts:
                 import time
                 time.sleep(1.0)
@@ -686,6 +679,102 @@ def load_drum_kit(ctx: Context, track_index: int, rack_uri: str, kit_path: str) 
     except Exception as e:
         logger.error(f"Error loading drum kit: {str(e)}")
         return f"Error loading drum kit: {str(e)}"
+
+# ── Arrangement view tools ────────────────────────────────────────────────────
+
+@mcp.tool()
+def switch_to_arrangement_view(ctx: Context) -> str:
+    """Switch Ableton's main window to the Arrangement view."""
+    try:
+        ableton = get_ableton_connection()
+        ableton.send_command("switch_to_arrangement_view")
+        return "Switched to Arrangement view"
+    except Exception as e:
+        logger.error(f"Error switching to arrangement view: {str(e)}")
+        return f"Error switching to arrangement view: {str(e)}"
+
+
+@mcp.tool()
+def set_arrangement_time(ctx: Context, time: float) -> str:
+    """
+    Move the arrangement playhead to a specific position.
+
+    Parameters:
+    - time: Position in beats from the start of the arrangement (e.g. 8.0 = bar 3 in 4/4)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_current_song_time", {"time": time})
+        return f"Playhead moved to beat {result.get('current_song_time', time)}"
+    except Exception as e:
+        logger.error(f"Error setting arrangement time: {str(e)}")
+        return f"Error setting arrangement time: {str(e)}"
+
+
+@mcp.tool()
+def get_arrangement_clips(ctx: Context, track_index: int) -> str:
+    """
+    List all clips placed in the Arrangement timeline for a track.
+
+    Returns each clip's name, start_time, end_time, length, and type.
+
+    Parameters:
+    - track_index: The index of the track to inspect
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_arrangement_clips", {"track_index": track_index})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting arrangement clips: {str(e)}")
+        return f"Error getting arrangement clips: {str(e)}"
+
+
+@mcp.tool()
+def duplicate_to_arrangement(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    destination_time: float
+) -> str:
+    """
+    Copy a Session-view clip into the Arrangement timeline.
+
+    Uses Live's track.duplicate_clip_to_arrangement() API (Live 11 / 12).
+    The clip is placed at destination_time beats from the start of the
+    arrangement on the same track it lives in.
+
+    Typical workflow:
+      1. create_clip / add_notes_to_clip to build a Session clip
+      2. Call duplicate_to_arrangement once per bar/section you need
+      3. Call switch_to_arrangement_view to confirm the result in Live
+
+    Parameters:
+    - track_index:       Index of the track that owns the Session clip
+    - clip_index:        Index of the clip slot in that track (Session view)
+    - destination_time:  Beat position in the arrangement to place the clip
+                         (e.g. 0.0 = start, 8.0 = bar 3 in 4/4)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "duplicate_session_clip_to_arrangement",
+            {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "destination_time": destination_time
+            }
+        )
+        clip_name = result.get("clip_name", "clip")
+        track_name = result.get("track_name", f"track {track_index}")
+        return (
+            f"Duplicated '{clip_name}' from Session slot {clip_index} "
+            f"on '{track_name}' to arrangement at beat {destination_time}"
+        )
+    except Exception as e:
+        logger.error(f"Error duplicating clip to arrangement: {str(e)}")
+        return f"Error duplicating clip to arrangement: {str(e)}"
+
 
 # Main execution
 def main():

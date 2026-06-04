@@ -17,7 +17,7 @@ except ImportError:
 
 # Constants for socket communication
 DEFAULT_PORT = 9877
-HOST = "localhost"
+HOST = "0.0.0.0"
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -230,7 +230,10 @@ class AbletonMCP(ControlSurface):
             elif command_type in ["create_midi_track", "set_track_name",
                                  "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
-                                 "start_playback", "stop_playback", "load_browser_item"]:
+                                 "start_playback", "stop_playback", "load_browser_item",
+                                 # Arrangement view – must run on the main thread
+                                 "switch_to_arrangement_view", "set_current_song_time",
+                                 "duplicate_session_clip_to_arrangement"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -288,7 +291,19 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             item_uri = params.get("item_uri", "")
                             result = self._load_browser_item(track_index, item_uri)
-                        
+                        # ── Arrangement view commands ──────────────────────────────
+                        elif command_type == "switch_to_arrangement_view":
+                            result = self._switch_to_arrangement_view()
+                        elif command_type == "set_current_song_time":
+                            time_val = params.get("time", 0.0)
+                            result = self._set_current_song_time(time_val)
+                        elif command_type == "duplicate_session_clip_to_arrangement":
+                            track_index = params.get("track_index", 0)
+                            clip_index = params.get("clip_index", 0)
+                            destination_time = params.get("destination_time", 0.0)
+                            result = self._duplicate_session_clip_to_arrangement(
+                                track_index, clip_index, destination_time)
+
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
                     except Exception as e:
@@ -337,6 +352,10 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_browser_items_at_path":
                 path = params.get("path", "")
                 response["result"] = self.get_browser_items_at_path(path)
+            # Read-only arrangement command – no main-thread scheduling required
+            elif command_type == "get_arrangement_clips":
+                track_index = params.get("track_index", 0)
+                response["result"] = self._get_arrangement_clips(track_index)
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -350,6 +369,14 @@ class AbletonMCP(ControlSurface):
     
     # Command implementations
     
+    def _safe_song_property(self, attr, cast, default):
+        """Read self._song.<attr> with cast, returning default on common failures.
+        Catches only narrow exceptions so genuine bugs still surface."""
+        try:
+            return cast(getattr(self._song, attr))
+        except (AttributeError, TypeError, ValueError):
+            return default
+
     def _get_session_info(self):
         """Get information about the current session"""
         try:
@@ -363,7 +390,18 @@ class AbletonMCP(ControlSurface):
                     "name": "Master",
                     "volume": self._song.master_track.mixer_device.volume.value,
                     "panning": self._song.master_track.mixer_device.panning.value
-                }
+                },
+                # Transport / playback state — lets clients render a live
+                # playhead without polling separately. Each property is read
+                # via _safe_song_property so an attribute missing on a given
+                # Live version falls back to its default rather than breaking
+                # the response shape.
+                "is_playing":        self._safe_song_property("is_playing",        bool,  False),
+                "current_song_time": self._safe_song_property("current_song_time", float, 0.0),
+                "song_length":       self._safe_song_property("song_length",       float, 0.0),
+                "loop":              self._safe_song_property("loop",              bool,  False),
+                "loop_start":        self._safe_song_property("loop_start",        float, 0.0),
+                "loop_length":       self._safe_song_property("loop_length",       float, 0.0),
             }
             return result
         except Exception as e:
@@ -699,6 +737,107 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error stopping playback: " + str(e))
             raise
     
+    # ── Arrangement view implementations ──────────────────────────────────────
+
+    def _switch_to_arrangement_view(self):
+        """Switch Ableton's main window to the Arrangement view"""
+        try:
+            self.application().view.show_view("Arranger")
+            return {"view": "Arranger"}
+        except Exception as e:
+            self.log_message("Error switching to arrangement view: " + str(e))
+            raise
+
+    def _set_current_song_time(self, time_val):
+        """Move the arrangement playhead to a position in beats"""
+        try:
+            self._song.current_song_time = float(time_val)
+            return {"current_song_time": self._song.current_song_time}
+        except Exception as e:
+            self.log_message("Error setting current song time: " + str(e))
+            raise
+
+    def _get_arrangement_clips(self, track_index):
+        """Return all clips placed in the Arrangement timeline for a track.
+
+        Each clip dict contains:
+          name, start_time, end_time, length, color,
+          is_midi_clip, is_audio_clip, is_playing
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+            clips = []
+
+            # track.arrangement_clips is available in Live 11 / 12
+            for clip in track.arrangement_clips:
+                clips.append({
+                    "name": clip.name,
+                    "start_time": clip.start_time,
+                    "end_time": clip.end_time,
+                    "length": clip.length,
+                    "color": clip.color,
+                    "is_midi_clip": clip.is_midi_clip,
+                    "is_audio_clip": clip.is_audio_clip,
+                    "is_playing": clip.is_playing
+                })
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "clip_count": len(clips),
+                "clips": clips
+            }
+        except Exception as e:
+            self.log_message("Error getting arrangement clips: " + str(e))
+            raise
+
+    def _duplicate_session_clip_to_arrangement(self, track_index, clip_index, destination_time):
+        """Copy a Session-view clip into the Arrangement timeline.
+
+        Uses the real Live API:
+          track.duplicate_clip_to_arrangement(clip, destination_time)
+
+        Available in Live 11 / 12.  destination_time is in beats from the
+        start of the arrangement.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip slot index out of range")
+
+            clip_slot = track.clip_slots[clip_index]
+
+            if not clip_slot.has_clip:
+                raise Exception(
+                    "No clip in slot " + str(clip_index) +
+                    " on track " + str(track_index)
+                )
+
+            clip = clip_slot.clip
+
+            # Duplicate to arrangement at the requested beat position
+            track.duplicate_clip_to_arrangement(clip, float(destination_time))
+
+            return {
+                "success": True,
+                "track_index": track_index,
+                "track_name": track.name,
+                "clip_name": clip.name,
+                "destination_time": destination_time
+            }
+        except Exception as e:
+            self.log_message("Error duplicating clip to arrangement: " + str(e))
+            raise
+
+    # ── Browser implementations ───────────────────────────────────────────────
+
     def _get_browser_item(self, uri, path):
         """Get a browser item by URI or path"""
         try:
@@ -820,42 +959,93 @@ class AbletonMCP(ControlSurface):
             self.log_message(traceback.format_exc())
             raise
     
+    # Substring markers that point a URI at a likely root. If no marker
+    # matches we fall back to the default order, so this is purely an
+    # optimisation — never a correctness change.
+    _URI_ROOT_HINTS = (
+        ('plugins',       ('vst:', 'vst3:', 'au:', 'query:plugins', 'plugin#')),
+        ('max_for_live',  ('max for live', 'maxforlive', 'm4l', 'query:max')),
+        ('user_library',  ('user library', 'userlibrary', 'query:user library', 'query:user-library')),
+        ('packs',         ('query:packs', '/packs/')),
+        ('samples',       ('query:samples', 'sample:', '/samples/')),
+        ('drums',         ('query:drums', '/drums/')),
+        ('instruments',   ('query:instruments', '/instruments/')),
+        ('sounds',        ('query:sounds', '/sounds/')),
+        ('audio_effects', ('query:audio effects', 'audioeffects', '/audio_effects/')),
+        ('midi_effects',  ('query:midi effects', 'midieffects', '/midi_effects/')),
+    )
+
+    def _order_roots_by_uri(self, roots, uri):
+        """Reorder ``roots`` so the URI's likely root is walked first."""
+        if not isinstance(uri, (bytes, str)) or not uri:
+            return roots
+        lowered = uri.lower()
+        for attr, markers in self._URI_ROOT_HINTS:
+            if any(m in lowered for m in markers):
+                head = [(a, r) for (a, r) in roots if a == attr]
+                tail = [(a, r) for (a, r) in roots if a != attr]
+                return head + tail
+        return roots
+
     def _find_browser_item_by_uri(self, browser_or_item, uri, max_depth=10, current_depth=0):
-        """Find a browser item by its URI"""
+        """Find a browser item by its URI.
+
+        Top-level lookups are memoised on ``self._uri_cache`` so repeated
+        loads of the same URI don't re-walk the entire browser tree.
+        """
+        if current_depth == 0:
+            cache = getattr(self, '_uri_cache', None)
+            if cache is None:
+                self._uri_cache = cache = {}
+            if uri in cache:
+                return cache[uri]
+            result = self._walk_browser_for_uri(browser_or_item, uri, max_depth, 0)
+            if result is not None:
+                cache[uri] = result
+            return result
+        return self._walk_browser_for_uri(browser_or_item, uri, max_depth, current_depth)
+
+    def _walk_browser_for_uri(self, browser_or_item, uri, max_depth, current_depth):
+        """Recursive walk used by :py:meth:`_find_browser_item_by_uri`."""
         try:
             # Check if this is the item we're looking for
             if hasattr(browser_or_item, 'uri') and browser_or_item.uri == uri:
                 return browser_or_item
-            
+
             # Stop recursion if we've reached max depth
             if current_depth >= max_depth:
                 return None
-            
+
             # Check if this is a browser with root categories
             if hasattr(browser_or_item, 'instruments'):
-                # Check all main categories
-                categories = [
-                    browser_or_item.instruments,
-                    browser_or_item.sounds,
-                    browser_or_item.drums,
-                    browser_or_item.audio_effects,
-                    browser_or_item.midi_effects
+                roots = [
+                    ('instruments', browser_or_item.instruments),
+                    ('sounds', browser_or_item.sounds),
+                    ('drums', browser_or_item.drums),
+                    ('audio_effects', browser_or_item.audio_effects),
+                    ('midi_effects', browser_or_item.midi_effects),
                 ]
-                
-                for category in categories:
+                for extra_attr in ('plugins', 'max_for_live', 'user_library', 'packs', 'samples'):
+                    if hasattr(browser_or_item, extra_attr):
+                        try:
+                            roots.append((extra_attr, getattr(browser_or_item, extra_attr)))
+                        except (AttributeError, RuntimeError) as e:
+                            self.log_message("Could not access browser.{0}: {1}".format(extra_attr, str(e)))
+
+                for _attr, category in self._order_roots_by_uri(roots, uri):
                     item = self._find_browser_item_by_uri(category, uri, max_depth, current_depth + 1)
                     if item:
                         return item
-                
+
                 return None
-            
+
             # Check if this item has children
             if hasattr(browser_or_item, 'children') and browser_or_item.children:
                 for child in browser_or_item.children:
                     item = self._find_browser_item_by_uri(child, uri, max_depth, current_depth + 1)
                     if item:
                         return item
-            
+
             return None
         except Exception as e:
             self.log_message("Error finding browser item by URI: {0}".format(str(e)))
