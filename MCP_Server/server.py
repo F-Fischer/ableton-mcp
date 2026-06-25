@@ -113,7 +113,8 @@ class AbletonConnection:
         is_modifying_command = command_type in [
             "create_midi_track", "create_audio_track", "set_track_name",
             "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
-            "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
+            "set_tempo", "fire_clip", "stop_clip", "set_device_parameter", "set_multiple_device_parameters",
+            "delete_track", "delete_clip", "delete_device",
             "start_playback", "stop_playback", "load_instrument_or_effect",
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
@@ -322,6 +323,28 @@ def create_midi_track(ctx: Context, index: int = -1, user_prompt: str = "") -> s
 
 
 @mcp.tool()
+@telemetry_tool("delete_track")
+def delete_track(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a track from the Ableton session, including all its clips and devices.
+
+    This is destructive and cannot be undone from the MCP server - use Ableton's
+    own undo (Cmd/Ctrl+Z) in the app if you need to recover the track.
+
+    Parameters:
+    - track_index: The index of the track to delete
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_track", {"track_index": track_index})
+        return f"Deleted track '{result.get('deleted_track_name', track_index)}'"
+    except Exception as e:
+        logger.error(f"Error deleting track: {str(e)}")
+        return f"Error deleting track: {str(e)}"
+
+
+@mcp.tool()
 @rich_telemetry_tool("set_track_name")
 def set_track_name(ctx: Context, track_index: int, name: str, user_prompt: str = "") -> str:
     """
@@ -394,6 +417,32 @@ def create_audio_clip(ctx: Context, track_index: int, clip_index: int, path: str
         return f"Error creating audio clip: {str(e)}"
 
 @mcp.tool()
+@telemetry_tool("get_clip_notes")
+def get_clip_notes(ctx: Context, track_index: int, clip_index: int, user_prompt: str = "") -> str:
+    """
+    Read all MIDI notes out of a clip.
+
+    Returns each note's pitch, start_time, duration, velocity, and mute state,
+    along with the clip's name and length. Useful for inspecting what's already
+    in a clip before editing it, or for reading back what add_notes_to_clip wrote.
+
+    Parameters:
+    - track_index: The index of the track containing the clip
+    - clip_index: The index of the clip slot containing the clip
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_clip_notes", {
+            "track_index": track_index,
+            "clip_index": clip_index
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting clip notes: {str(e)}")
+        return f"Error getting clip notes: {str(e)}"
+
+@mcp.tool()
 @rich_telemetry_tool("add_notes_to_clip", capture_notes=True)
 def add_notes_to_clip(
     ctx: Context,
@@ -448,6 +497,28 @@ def set_clip_name(ctx: Context, track_index: int, clip_index: int, name: str, us
         return f"Error setting clip name: {str(e)}"
 
 @mcp.tool()
+@telemetry_tool("delete_clip")
+def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: str = "") -> str:
+    """
+    Delete the clip in a track's clip slot.
+
+    Parameters:
+    - track_index: The index of the track containing the clip
+    - clip_index: The index of the clip slot containing the clip
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_clip", {
+            "track_index": track_index,
+            "clip_index": clip_index
+        })
+        return f"Deleted clip '{result.get('deleted_clip_name', clip_index)}' at track {track_index}, slot {clip_index}"
+    except Exception as e:
+        logger.error(f"Error deleting clip: {str(e)}")
+        return f"Error deleting clip: {str(e)}"
+
+@mcp.tool()
 @rich_telemetry_tool("set_tempo")
 def set_tempo(ctx: Context, tempo: float, user_prompt: str = "") -> str:
     """
@@ -497,6 +568,150 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str, user_pro
     except Exception as e:
         logger.error(f"Error loading instrument by URI: {str(e)}")
         return f"Error loading instrument by URI: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("get_device_parameters")
+def get_device_parameters(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    name_filter: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    List the parameters of a device (instrument or effect) on a track, with their
+    current values and valid ranges.
+
+    Works for any device, including sound-design synths like Wavetable, Analog,
+    Operator, Drift, and Sampler - their oscillators, filters, envelopes, and LFOs
+    are all exposed as named parameters here. These devices can have 50-100+
+    parameters, so pass name_filter (a case-insensitive substring, e.g. "Filter",
+    "Osc 1", "Env") to narrow the list to the section you're designing.
+
+    Parameters:
+    - track_index: The index of the track the device is on
+    - device_index: The index of the device on the track (see get_track_info for the device list)
+    - name_filter: Optional case-insensitive substring to filter parameter names by
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "name_filter": name_filter
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting device parameters: {str(e)}")
+        return f"Error getting device parameters: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("set_device_parameter")
+def set_device_parameter(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    value: float,
+    parameter_name: str = None,
+    parameter_index: int = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Set the value of a parameter on a device (instrument or effect), e.g. filter
+    cutoff, resonance, attack/decay/sustain/release, mix amount, etc.
+
+    Identify the parameter with either parameter_name or parameter_index (use
+    get_device_parameters first to discover the available names, indices, and
+    valid min/max range for the target device).
+
+    Parameters:
+    - track_index: The index of the track the device is on
+    - device_index: The index of the device on the track
+    - value: The new value to set, must be within the parameter's min/max range
+    - parameter_name: The name of the parameter to set (e.g. "Cutoff", "Resonance")
+    - parameter_index: The index of the parameter to set, alternative to parameter_name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_device_parameter", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_name": parameter_name,
+            "parameter_index": parameter_index,
+            "value": value
+        })
+        return f"Set '{result.get('parameter_name', parameter_name)}' on '{result.get('device_name', 'device')}' to {result.get('value', value)}"
+    except Exception as e:
+        logger.error(f"Error setting device parameter: {str(e)}")
+        return f"Error setting device parameter: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("set_multiple_device_parameters")
+def set_multiple_device_parameters(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    parameters: List[Dict[str, Union[str, int, float]]],
+    user_prompt: str = ""
+) -> str:
+    """
+    Set several parameters on a device in one call - useful for designing a sound
+    on a synth like Wavetable, Analog, or Operator where you typically want to move
+    several controls together (e.g. oscillator wave + filter cutoff + envelope decay).
+
+    Use get_device_parameters first to find each parameter's name/index and valid
+    min/max range. Each entry is applied independently: a bad value in one entry
+    is reported in the response but does not block the others from being applied.
+
+    Parameters:
+    - track_index: The index of the track the device is on
+    - device_index: The index of the device on the track
+    - parameters: List of dicts, each with "value" and either "parameter_name" or
+      "parameter_index", e.g. [{"parameter_name": "Cutoff", "value": 0.4},
+      {"parameter_name": "Resonance", "value": 0.2}]
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_multiple_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameters": parameters
+        })
+        applied = result.get("applied", [])
+        errors = result.get("errors", [])
+        summary = f"Set {len(applied)} parameter(s) on '{result.get('device_name', 'device')}'"
+        if errors:
+            error_list = ", ".join(f"{e.get('parameter_name') or e.get('parameter_index')}: {e.get('error')}" for e in errors)
+            summary += f". {len(errors)} failed: {error_list}"
+        return summary
+    except Exception as e:
+        logger.error(f"Error setting multiple device parameters: {str(e)}")
+        return f"Error setting multiple device parameters: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("delete_device")
+def delete_device(ctx: Context, track_index: int, device_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a device (instrument or effect) from a track.
+
+    Parameters:
+    - track_index: The index of the track the device is on
+    - device_index: The index of the device on the track
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_device", {
+            "track_index": track_index,
+            "device_index": device_index
+        })
+        return f"Deleted device '{result.get('deleted_device_name', device_index)}' from track {track_index}"
+    except Exception as e:
+        logger.error(f"Error deleting device: {str(e)}")
+        return f"Error deleting device: {str(e)}"
 
 @mcp.tool()
 @telemetry_tool("fire_clip")

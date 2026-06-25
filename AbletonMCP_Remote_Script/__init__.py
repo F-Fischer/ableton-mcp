@@ -226,11 +226,22 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_track_info(track_index)
+            elif command_type == "get_device_parameters":
+                track_index = params.get("track_index", 0)
+                device_index = params.get("device_index", 0)
+                name_filter = params.get("name_filter")
+                response["result"] = self._get_device_parameters(track_index, device_index, name_filter)
+            elif command_type == "get_clip_notes":
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_clip_notes(track_index, clip_index)
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "set_track_name",
                                  "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback", "load_browser_item",
+                                 "set_device_parameter", "set_multiple_device_parameters",
+                                 "delete_track", "delete_clip", "delete_device",
                                  # Arrangement view – must run on the main thread
                                  "switch_to_arrangement_view", "set_current_song_time",
                                  "duplicate_session_clip_to_arrangement"]:
@@ -291,6 +302,31 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             item_uri = params.get("item_uri", "")
                             result = self._load_browser_item(track_index, item_uri)
+                        elif command_type == "set_device_parameter":
+                            track_index = params.get("track_index", 0)
+                            device_index = params.get("device_index", 0)
+                            parameter_name = params.get("parameter_name")
+                            parameter_index = params.get("parameter_index")
+                            value = params.get("value", 0.0)
+                            result = self._set_device_parameter(
+                                track_index, device_index, parameter_name, parameter_index, value)
+                        elif command_type == "set_multiple_device_parameters":
+                            track_index = params.get("track_index", 0)
+                            device_index = params.get("device_index", 0)
+                            parameters = params.get("parameters", [])
+                            result = self._set_multiple_device_parameters(
+                                track_index, device_index, parameters)
+                        elif command_type == "delete_track":
+                            track_index = params.get("track_index", 0)
+                            result = self._delete_track(track_index)
+                        elif command_type == "delete_clip":
+                            track_index = params.get("track_index", 0)
+                            clip_index = params.get("clip_index", 0)
+                            result = self._delete_clip(track_index, clip_index)
+                        elif command_type == "delete_device":
+                            track_index = params.get("track_index", 0)
+                            device_index = params.get("device_index", 0)
+                            result = self._delete_device(track_index, device_index)
                         # ── Arrangement view commands ──────────────────────────────
                         elif command_type == "switch_to_arrangement_view":
                             result = self._switch_to_arrangement_view()
@@ -463,6 +499,183 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting track info: " + str(e))
             raise
     
+    def _delete_track(self, track_index):
+        """Delete a track from the session"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track_name = self._song.tracks[track_index].name
+            self._song.delete_track(track_index)
+
+            return {"deleted_track_name": track_name, "track_index": track_index}
+        except Exception as e:
+            self.log_message("Error deleting track: " + str(e))
+            raise
+
+    def _delete_clip(self, track_index, clip_index):
+        """Delete the clip in a track's clip slot"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+
+            clip_slot = track.clip_slots[clip_index]
+
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+
+            clip_name = clip_slot.clip.name
+            clip_slot.delete_clip()
+
+            return {"deleted_clip_name": clip_name, "track_index": track_index, "clip_index": clip_index}
+        except Exception as e:
+            self.log_message("Error deleting clip: " + str(e))
+            raise
+
+    def _delete_device(self, track_index, device_index):
+        """Delete a device from a track"""
+        try:
+            device = self._get_device(track_index, device_index)
+            device_name = device.name
+            track = self._song.tracks[track_index]
+            track.delete_device(device_index)
+
+            return {"deleted_device_name": device_name, "track_index": track_index, "device_index": device_index}
+        except Exception as e:
+            self.log_message("Error deleting device: " + str(e))
+            raise
+
+    def _get_device(self, track_index, device_index):
+        """Resolve a device on a track, raising IndexError if out of range"""
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+
+        track = self._song.tracks[track_index]
+
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index out of range")
+
+        return track.devices[device_index]
+
+    def _get_device_parameters(self, track_index, device_index, name_filter=None):
+        """List the parameters of a device, with their current value and range.
+
+        Synths like Wavetable/Operator/Analog can expose 50-100+ parameters
+        through this same generic interface (oscillators, filters, envelopes,
+        LFOs, etc. are all just named device parameters in the Live API) -
+        name_filter lets a caller narrow down to e.g. "Filter" or "Osc 1"
+        instead of pulling the entire list every time.
+        """
+        try:
+            device = self._get_device(track_index, device_index)
+
+            needle = name_filter.lower() if name_filter else None
+
+            parameters = []
+            for param_index, param in enumerate(device.parameters):
+                if needle and needle not in param.name.lower():
+                    continue
+                parameters.append({
+                    "index": param_index,
+                    "name": param.name,
+                    "value": param.value,
+                    "min": param.min,
+                    "max": param.max,
+                    "is_quantized": param.is_quantized,
+                    "value_items": list(param.value_items) if param.is_quantized else None
+                })
+
+            result = {
+                "device_name": device.name,
+                "device_index": device_index,
+                "parameter_count": len(device.parameters),
+                "parameters": parameters
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error getting device parameters: " + str(e))
+            raise
+
+    def _resolve_parameter(self, device, parameter_name, parameter_index):
+        """Find a device parameter by index or by exact name"""
+        if parameter_index is not None:
+            if parameter_index < 0 or parameter_index >= len(device.parameters):
+                raise IndexError("Parameter index out of range")
+            return device.parameters[parameter_index]
+        elif parameter_name is not None:
+            for candidate in device.parameters:
+                if candidate.name == parameter_name:
+                    return candidate
+            raise Exception("Parameter '" + str(parameter_name) + "' not found on device '" + device.name + "'")
+        else:
+            raise Exception("Must provide either parameter_name or parameter_index")
+
+    def _apply_parameter_value(self, param, value):
+        """Validate and apply a value to a resolved parameter"""
+        if value < param.min or value > param.max:
+            raise Exception(
+                "Value " + str(value) + " out of range for parameter '" + param.name +
+                "' (min " + str(param.min) + ", max " + str(param.max) + ")")
+        param.value = value
+
+    def _set_device_parameter(self, track_index, device_index, parameter_name, parameter_index, value):
+        """Set a single device parameter's value, looked up by name or index"""
+        try:
+            device = self._get_device(track_index, device_index)
+            param = self._resolve_parameter(device, parameter_name, parameter_index)
+            self._apply_parameter_value(param, value)
+
+            result = {
+                "device_name": device.name,
+                "parameter_name": param.name,
+                "value": param.value
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error setting device parameter: " + str(e))
+            raise
+
+    def _set_multiple_device_parameters(self, track_index, device_index, parameters):
+        """Set several device parameters in one call - e.g. shaping a sound by
+        moving several Wavetable/Analog/Operator controls (osc, filter, envelope,
+        LFO) together. Applies every change it can and reports per-parameter
+        success/failure rather than aborting on the first bad value.
+        """
+        try:
+            device = self._get_device(track_index, device_index)
+
+            applied = []
+            errors = []
+            for entry in parameters:
+                p_name = entry.get("parameter_name")
+                p_index = entry.get("parameter_index")
+                value = entry.get("value")
+                try:
+                    param = self._resolve_parameter(device, p_name, p_index)
+                    self._apply_parameter_value(param, value)
+                    applied.append({"parameter_name": param.name, "value": param.value})
+                except Exception as param_error:
+                    errors.append({
+                        "parameter_name": p_name,
+                        "parameter_index": p_index,
+                        "error": str(param_error)
+                    })
+
+            result = {
+                "device_name": device.name,
+                "applied": applied,
+                "errors": errors
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error setting multiple device parameters: " + str(e))
+            raise
+
     def _create_midi_track(self, index):
         """Create a new MIDI track at the specified index"""
         try:
@@ -621,6 +834,52 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error adding notes to clip: " + str(e))
             raise
     
+    def _get_clip_notes(self, track_index, clip_index):
+        """Read all MIDI notes out of a clip"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+
+            clip_slot = track.clip_slots[clip_index]
+
+            if not clip_slot.has_clip:
+                raise Exception("No clip in slot")
+
+            clip = clip_slot.clip
+
+            if not clip.is_midi_clip:
+                raise Exception("Clip is not a MIDI clip")
+
+            # (pitch, start_time, duration, velocity, mute) tuples covering the
+            # full clip length and the full MIDI pitch range
+            raw_notes = clip.get_notes(0, 0, clip.length, 128)
+
+            notes = []
+            for pitch, start_time, duration, velocity, mute in raw_notes:
+                notes.append({
+                    "pitch": pitch,
+                    "start_time": start_time,
+                    "duration": duration,
+                    "velocity": velocity,
+                    "mute": mute
+                })
+
+            result = {
+                "clip_name": clip.name,
+                "length": clip.length,
+                "note_count": len(notes),
+                "notes": notes
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error getting clip notes: " + str(e))
+            raise
+
     def _set_clip_name(self, track_index, clip_index, name):
         """Set the name of a clip"""
         try:
