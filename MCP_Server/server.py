@@ -6,13 +6,32 @@ import logging
 import os
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import AsyncIterator, Dict, Any, List, Union, Optional
 
 from .telemetry import record_startup
 from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
+from . import music_theory
 
 ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
 ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
+
+PROJECT_STATE_PATH = os.path.join(os.path.dirname(__file__), "project_key.json")
+
+
+def _load_project_state() -> Dict[str, Any]:
+    try:
+        with open(PROJECT_STATE_PATH, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {"tonic": None, "mode": None, "tempo": None, "genre": None}
+
+
+def _save_project_state(state: Dict[str, Any]) -> None:
+    with open(PROJECT_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+PROJECT = _load_project_state()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -449,6 +468,8 @@ def add_notes_to_clip(
     track_index: int,
     clip_index: int,
     notes: List[Dict[str, Union[int, float, bool]]],
+    snap_to_scale: bool = False,
+    key: Optional[Dict[str, str]] = None,
     user_prompt: str = ""
 ) -> str:
     """
@@ -458,19 +479,112 @@ def add_notes_to_clip(
     - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot containing the clip
     - notes: List of note dictionaries, each with pitch, start_time, duration, velocity, and mute
+    - snap_to_scale: If True, snap each note's pitch to the nearest pitch in `key`
+      (or the project key set via set_project_key, if `key` is omitted)
+    - key: Optional {"tonic": ..., "mode": ...} override for snapping. Defaults to the project key.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        snapped = []
+        if snap_to_scale:
+            tonic = (key or {}).get("tonic") or PROJECT.get("tonic")
+            mode = (key or {}).get("mode") or PROJECT.get("mode")
+            if not tonic or not mode:
+                raise ValueError(
+                    "snap_to_scale requires a key — pass `key` or call set_project_key first"
+                )
+            music_theory.validate_tonic_mode(tonic, mode)
+
+            for note in notes:
+                original_pitch = note["pitch"]
+                snapped_pitch = music_theory.snap_to_scale(original_pitch, tonic, mode)
+                if snapped_pitch != original_pitch:
+                    snapped.append({"from": original_pitch, "to": snapped_pitch})
+                    note["pitch"] = snapped_pitch
+
         ableton = get_ableton_connection()
-        result = ableton.send_command("add_notes_to_clip", {
+        ableton.send_command("add_notes_to_clip", {
             "track_index": track_index,
             "clip_index": clip_index,
             "notes": notes
         })
-        return f"Added {len(notes)} notes to clip at track {track_index}, slot {clip_index}"
+
+        message = f"Added {len(notes)} notes to clip at track {track_index}, slot {clip_index}"
+        if snapped:
+            message += f". Snapped {len(snapped)} note(s) to scale: {snapped}"
+        return message
     except Exception as e:
         logger.error(f"Error adding notes to clip: {str(e)}")
         return f"Error adding notes to clip: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("set_project_key")
+def set_project_key(
+    ctx: Context,
+    tonic: str,
+    mode: str,
+    tempo: Optional[float] = None,
+    genre: Optional[str] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Set the project's tonal center (key/mode), and optionally tempo and genre.
+
+    This is the foundation for every composition tool: chord/bass/drum generators
+    and snap_to_scale all read this state. Does not touch Live unless tempo is given.
+
+    Parameters:
+    - tonic: Root note, e.g. "Bb", "C#", "F" (see music_theory.NOTE_NAMES)
+    - mode: Scale/mode name, e.g. "major", "minor", "dorian", "phrygian_dominant"
+    - tempo: If given, also sets the Live project tempo
+    - genre: Optional genre tag (e.g. "dnb_liquid"), used by generators for style defaults
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        music_theory.validate_tonic_mode(tonic, mode)
+
+        if genre is not None and genre not in music_theory.GENRES:
+            raise ValueError(f"Unknown genre '{genre}'. Expected one of {sorted(music_theory.GENRES)}")
+
+        PROJECT["tonic"] = tonic
+        PROJECT["mode"] = mode
+        if tempo is not None:
+            PROJECT["tempo"] = tempo
+        if genre is not None:
+            PROJECT["genre"] = genre
+        _save_project_state(PROJECT)
+
+        if tempo is not None:
+            ableton = get_ableton_connection()
+            ableton.send_command("set_tempo", {"tempo": tempo})
+
+        result = dict(PROJECT)
+        result["scale_pitch_classes"] = sorted(music_theory.scale_pitch_classes(tonic, mode))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting project key: {str(e)}")
+        return f"Error setting project key: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_project_key")
+def get_project_key(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Get the project's current tonal center (key/mode), tempo, and genre,
+    as previously set with set_project_key.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = dict(PROJECT)
+        if PROJECT.get("tonic") and PROJECT.get("mode"):
+            result["scale_pitch_classes"] = sorted(
+                music_theory.scale_pitch_classes(PROJECT["tonic"], PROJECT["mode"])
+            )
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting project key: {str(e)}")
+        return f"Error getting project key: {str(e)}"
 
 @mcp.tool()
 @rich_telemetry_tool("set_clip_name")
@@ -992,7 +1106,8 @@ def get_arrangement_clips(ctx: Context, track_index: int, user_prompt: str = "")
     """
     List all clips placed in the Arrangement timeline for a track.
 
-    Returns each clip's name, start_time, end_time, length, and type.
+    Returns each clip's index, name, start_time, end_time, length, and type.
+    The index can be passed to get_arrangement_clip_notes to read a MIDI clip's notes.
 
     Parameters:
     - track_index: The index of the track to inspect
@@ -1005,6 +1120,33 @@ def get_arrangement_clips(ctx: Context, track_index: int, user_prompt: str = "")
     except Exception as e:
         logger.error(f"Error getting arrangement clips: {str(e)}")
         return f"Error getting arrangement clips: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_arrangement_clip_notes")
+def get_arrangement_clip_notes(ctx: Context, track_index: int, clip_index: int, user_prompt: str = "") -> str:
+    """
+    Read all MIDI notes out of a clip placed in the Arrangement timeline.
+
+    Returns each note's pitch, start_time, duration, velocity, and mute state,
+    along with the clip's name and length. Use get_arrangement_clips first to
+    find the clip's index.
+
+    Parameters:
+    - track_index: The index of the track containing the clip
+    - clip_index: The index of the clip within track.arrangement_clips, as
+      returned by get_arrangement_clips
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_arrangement_clip_notes", {
+            "track_index": track_index,
+            "clip_index": clip_index
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting arrangement clip notes: {str(e)}")
+        return f"Error getting arrangement clip notes: {str(e)}"
 
 
 @mcp.tool()
@@ -1054,6 +1196,116 @@ def duplicate_to_arrangement(
     except Exception as e:
         logger.error(f"Error duplicating clip to arrangement: {str(e)}")
         return f"Error duplicating clip to arrangement: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("create_arrangement_midi_clip")
+def create_arrangement_midi_clip(
+    ctx: Context,
+    track_index: int,
+    start_time: float,
+    length: float = 4.0,
+    user_prompt: str = ""
+) -> str:
+    """
+    Create a brand-new empty MIDI clip directly in the Arrangement timeline,
+    without going through a Session clip slot first.
+
+    Parameters:
+    - track_index: Index of the MIDI track to create the clip on
+    - start_time: Beat position in the arrangement where the clip starts
+    - length: Length of the clip in beats (default 4.0)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_arrangement_midi_clip", {
+            "track_index": track_index,
+            "start_time": start_time,
+            "length": length
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error creating arrangement MIDI clip: {str(e)}")
+        return f"Error creating arrangement MIDI clip: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_locators")
+def get_locators(ctx: Context, user_prompt: str = "") -> str:
+    """
+    List all arrangement locators (markers/cue points) with their name and
+    beat position. Use this to find a named marker (e.g. "Drop") before
+    navigating or placing clips relative to it.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_locators")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting locators: {str(e)}")
+        return f"Error getting locators: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_track_hierarchy")
+def get_track_hierarchy(ctx: Context, user_prompt: str = "") -> str:
+    """
+    List all tracks with their group/folder membership, so group tracks and
+    the tracks nested inside them can be identified without guessing indices.
+
+    Returns each track's index, name, color, whether it's a group (folder)
+    track, and the index of the group track it belongs to (if any).
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_track_hierarchy")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting track hierarchy: {str(e)}")
+        return f"Error getting track hierarchy: {str(e)}"
+
+@mcp.tool()
+@telemetry_tool("get_selected")
+def get_selected(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Get the track, scene, and device currently selected in the Live UI.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_selected")
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error getting selection: {str(e)}")
+        return f"Error getting selection: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("set_track_color")
+def set_track_color(ctx: Context, track_index: int, color: int, user_prompt: str = "") -> str:
+    """
+    Set a track's color.
+
+    Parameters:
+    - track_index: The index of the track to recolor
+    - color: 24-bit RGB integer (e.g. 0xFF0000 for red, 16711680 decimal)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_track_color", {
+            "track_index": track_index,
+            "color": color
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error setting track color: {str(e)}")
+        return f"Error setting track color: {str(e)}"
 
 
 # Main execution

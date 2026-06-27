@@ -244,7 +244,8 @@ class AbletonMCP(ControlSurface):
                                  "delete_track", "delete_clip", "delete_device",
                                  # Arrangement view – must run on the main thread
                                  "switch_to_arrangement_view", "set_current_song_time",
-                                 "duplicate_session_clip_to_arrangement"]:
+                                 "duplicate_session_clip_to_arrangement", "create_arrangement_midi_clip",
+                                 "set_track_color"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -339,6 +340,16 @@ class AbletonMCP(ControlSurface):
                             destination_time = params.get("destination_time", 0.0)
                             result = self._duplicate_session_clip_to_arrangement(
                                 track_index, clip_index, destination_time)
+                        elif command_type == "create_arrangement_midi_clip":
+                            track_index = params.get("track_index", 0)
+                            start_time = params.get("start_time", 0.0)
+                            length = params.get("length", 4.0)
+                            result = self._create_arrangement_midi_clip(
+                                track_index, start_time, length)
+                        elif command_type == "set_track_color":
+                            track_index = params.get("track_index", 0)
+                            color = params.get("color")
+                            result = self._set_track_color(track_index, color)
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -392,6 +403,16 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_arrangement_clips":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_arrangement_clips(track_index)
+            elif command_type == "get_arrangement_clip_notes":
+                track_index = params.get("track_index", 0)
+                clip_index = params.get("clip_index", 0)
+                response["result"] = self._get_arrangement_clip_notes(track_index, clip_index)
+            elif command_type == "get_locators":
+                response["result"] = self._get_locators()
+            elif command_type == "get_track_hierarchy":
+                response["result"] = self._get_track_hierarchy()
+            elif command_type == "get_selected":
+                response["result"] = self._get_selected()
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -491,6 +512,8 @@ class AbletonMCP(ControlSurface):
                 "arm": track.arm,
                 "volume": track.mixer_device.volume.value,
                 "panning": track.mixer_device.panning.value,
+                "color": getattr(track, "color", None),
+                "is_foldable": getattr(track, "is_foldable", False),
                 "clip_slots": clip_slots,
                 "devices": devices
             }
@@ -1031,8 +1054,9 @@ class AbletonMCP(ControlSurface):
             clips = []
 
             # track.arrangement_clips is available in Live 11 / 12
-            for clip in track.arrangement_clips:
+            for index, clip in enumerate(track.arrangement_clips):
                 clips.append({
+                    "index": index,
                     "name": clip.name,
                     "start_time": clip.start_time,
                     "end_time": clip.end_time,
@@ -1051,6 +1075,207 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error getting arrangement clips: " + str(e))
+            raise
+
+    def _get_arrangement_clip_notes(self, track_index, clip_index):
+        """Read all MIDI notes out of a clip placed in the Arrangement timeline.
+
+        clip_index refers to the position of the clip in track.arrangement_clips,
+        matching the "index" field returned by get_arrangement_clips.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+            arrangement_clips = list(track.arrangement_clips)
+
+            if clip_index < 0 or clip_index >= len(arrangement_clips):
+                raise IndexError("Clip index out of range")
+
+            clip = arrangement_clips[clip_index]
+
+            if not clip.is_midi_clip:
+                raise Exception("Clip is not a MIDI clip")
+
+            raw_notes = clip.get_notes(0, 0, clip.length, 128)
+
+            notes = []
+            for pitch, start_time, duration, velocity, mute in raw_notes:
+                notes.append({
+                    "pitch": pitch,
+                    "start_time": start_time,
+                    "duration": duration,
+                    "velocity": velocity,
+                    "mute": mute
+                })
+
+            result = {
+                "clip_name": clip.name,
+                "length": clip.length,
+                "note_count": len(notes),
+                "notes": notes
+            }
+            return result
+        except Exception as e:
+            self.log_message("Error getting arrangement clip notes: " + str(e))
+            raise
+
+    def _create_arrangement_midi_clip(self, track_index, start_time, length):
+        """Create a brand-new empty MIDI clip directly in the Arrangement timeline.
+
+        Uses Track.create_midi_clip(start_time, length), available in Live 11 / 12.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+
+            if not getattr(track, "has_midi_input", False):
+                raise ValueError("Track %d is not a MIDI track" % track_index)
+
+            if not hasattr(track, "create_midi_clip"):
+                raise Exception(
+                    "Track.create_midi_clip is unavailable in this Ableton Live version."
+                )
+
+            clip = track.create_midi_clip(float(start_time), float(length))
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "clip_name": clip.name,
+                "start_time": clip.start_time,
+                "length": clip.length
+            }
+        except Exception as e:
+            self.log_message("Error creating arrangement MIDI clip: " + str(e))
+            raise
+
+    def _get_locators(self):
+        """Return all arrangement locators (markers/cue points) with their name and time"""
+        try:
+            locators = []
+            for index, cue_point in enumerate(self._song.cue_points):
+                locators.append({
+                    "index": index,
+                    "name": cue_point.name,
+                    "time": cue_point.time
+                })
+
+            return {
+                "locator_count": len(locators),
+                "locators": locators
+            }
+        except Exception as e:
+            self.log_message("Error getting locators: " + str(e))
+            raise
+
+    def _get_track_hierarchy(self):
+        """Return all tracks with their group membership, to make group/folder structure visible"""
+        try:
+            tracks = []
+            for index, track in enumerate(self._song.tracks):
+                group_track = getattr(track, "group_track", None)
+                group_index = None
+                if group_track is not None:
+                    for g_index, g_track in enumerate(self._song.tracks):
+                        if g_track == group_track:
+                            group_index = g_index
+                            break
+
+                tracks.append({
+                    "index": index,
+                    "name": track.name,
+                    "is_foldable": getattr(track, "is_foldable", False),
+                    "is_grouped": group_track is not None,
+                    "group_track_index": group_index,
+                    "color": getattr(track, "color", None)
+                })
+
+            return {
+                "track_count": len(tracks),
+                "tracks": tracks
+            }
+        except Exception as e:
+            self.log_message("Error getting track hierarchy: " + str(e))
+            raise
+
+    def _get_selected(self):
+        """Return the currently selected track, scene, and device in the Live UI"""
+        try:
+            view = self._song.view
+            result = {}
+
+            selected_track = view.selected_track
+            if selected_track is not None:
+                track_index = None
+                for index, track in enumerate(self._song.tracks):
+                    if track == selected_track:
+                        track_index = index
+                        break
+                result["selected_track"] = {
+                    "index": track_index,
+                    "name": selected_track.name
+                }
+            else:
+                result["selected_track"] = None
+
+            selected_scene = view.selected_scene
+            if selected_scene is not None:
+                scene_index = None
+                for index, scene in enumerate(self._song.scenes):
+                    if scene == selected_scene:
+                        scene_index = index
+                        break
+                result["selected_scene"] = {
+                    "index": scene_index,
+                    "name": selected_scene.name
+                }
+            else:
+                result["selected_scene"] = None
+
+            selected_device = None
+            if selected_track is not None:
+                selected_device = getattr(selected_track.view, "selected_device", None)
+            if selected_device is not None:
+                device_index = None
+                for index, device in enumerate(selected_track.devices):
+                    if device == selected_device:
+                        device_index = index
+                        break
+                result["selected_device"] = {
+                    "index": device_index,
+                    "name": selected_device.name
+                }
+            else:
+                result["selected_device"] = None
+
+            return result
+        except Exception as e:
+            self.log_message("Error getting selection: " + str(e))
+            raise
+
+    def _set_track_color(self, track_index, color):
+        """Set a track's color (24-bit RGB integer, e.g. 0xFF0000 for red)"""
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            if color is None:
+                raise ValueError("color is required")
+
+            track = self._song.tracks[track_index]
+            track.color = int(color)
+
+            return {
+                "track_index": track_index,
+                "track_name": track.name,
+                "color": track.color
+            }
+        except Exception as e:
+            self.log_message("Error setting track color: " + str(e))
             raise
 
     def _duplicate_session_clip_to_arrangement(self, track_index, clip_index, destination_time):
