@@ -4,6 +4,7 @@ import socket
 import json
 import logging
 import os
+import random
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union, Optional
@@ -1363,6 +1364,300 @@ def set_track_color(ctx: Context, track_index: int, color: int, user_prompt: str
     except Exception as e:
         logger.error(f"Error setting track color: {str(e)}")
         return f"Error setting track color: {str(e)}"
+
+
+# ── Composition generators (M3) ─────────────────────────────────────────────
+
+def _resolve_key(key: Optional[Dict[str, str]]) -> (str, str):
+    """Resolve a {tonic, mode} dict, falling back to the project key. Raises if neither is set."""
+    tonic = (key or {}).get("tonic") or PROJECT.get("tonic")
+    mode = (key or {}).get("mode") or PROJECT.get("mode")
+    if not tonic or not mode:
+        raise ValueError("No key given and no project key set — pass `key` or call set_project_key first")
+    music_theory.validate_tonic_mode(tonic, mode)
+    return tonic, mode
+
+
+def _prepare_destination_clip(
+    ableton,
+    track_index: int,
+    total_beats: float,
+    clip_index: Optional[int],
+    arrangement_start: Optional[float]
+) -> Dict[str, Any]:
+    """Resolve (and create if needed) the clip notes should be written into.
+
+    Exactly one of clip_index (Session slot) or arrangement_start (Arrangement
+    beat position) must be given. Returns {"mode": "session"|"arrangement", "clip_index": int}
+    where clip_index is always relative to the destination's own indexing
+    (clip_slots for session, arrangement_clips for arrangement).
+    """
+    if (clip_index is None) == (arrangement_start is None):
+        raise ValueError("Pass exactly one of clip_index or arrangement_start")
+
+    if clip_index is not None:
+        track_info = ableton.send_command("get_track_info", {"track_index": track_index})
+        slot = track_info["clip_slots"][clip_index]
+        if not slot["has_clip"]:
+            ableton.send_command("create_clip", {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "length": total_beats
+            })
+        return {"mode": "session", "clip_index": clip_index}
+
+    ableton.send_command("create_arrangement_midi_clip", {
+        "track_index": track_index,
+        "start_time": arrangement_start,
+        "length": total_beats
+    })
+    clips = ableton.send_command("get_arrangement_clips", {"track_index": track_index})["clips"]
+    for clip in clips:
+        if abs(clip["start_time"] - arrangement_start) < 1e-6:
+            return {"mode": "arrangement", "clip_index": clip["index"]}
+    raise Exception("Could not locate newly created arrangement clip")
+
+
+def _write_notes(ableton, track_index: int, destination: Dict[str, Any], notes: List[Dict[str, Any]]) -> None:
+    command = "add_notes_to_clip" if destination["mode"] == "session" else "add_notes_to_arrangement_clip"
+    ableton.send_command(command, {
+        "track_index": track_index,
+        "clip_index": destination["clip_index"],
+        "notes": notes
+    })
+
+
+@mcp.tool()
+@rich_telemetry_tool("generate_chord_progression")
+def generate_chord_progression(
+    ctx: Context,
+    track_index: int,
+    bars: int,
+    clip_index: Optional[int] = None,
+    arrangement_start: Optional[float] = None,
+    progression: Optional[List[int]] = None,
+    chord_size: int = 4,
+    octave: int = 4,
+    voicing: str = "open",
+    key: Optional[Dict[str, str]] = None,
+    rhythm: str = "sustained",
+    user_prompt: str = ""
+) -> str:
+    """
+    Write a diatonic chord progression as MIDI notes into a clip.
+
+    Parameters:
+    - track_index: Index of the MIDI track to write to
+    - bars: Length of the progression in bars
+    - clip_index: Session clip slot to write into (creates the clip if empty).
+      Pass exactly one of clip_index / arrangement_start.
+    - arrangement_start: Beat position in the Arrangement to create the clip at.
+    - progression: Scale degrees to use, e.g. [1, 6, 4, 5]. If omitted, picks an
+      idiomatic progression for the project's mode.
+    - chord_size: 3 = triad, 4 = seventh chord, 5 = ninth, etc.
+    - octave: Register for the chord roots (Ableton convention, C3 == MIDI 60)
+    - voicing: "close", "open", or "drop2"
+    - key: Optional {"tonic": ..., "mode": ...} override. Defaults to the project key.
+    - rhythm: "sustained" (long chords), "stab" (short hits on downbeats), or
+      "liquid" (sustained with slight overlap into the next chord)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        tonic, mode = _resolve_key(key)
+
+        chosen_progression = progression or music_theory.DEFAULT_PROGRESSIONS.get(
+            mode, music_theory.DEFAULT_PROGRESSION_FALLBACK
+        )
+
+        ableton = get_ableton_connection()
+        session_info = ableton.send_command("get_session_info")
+        beats_per_bar = session_info.get("signature_numerator", 4)
+        total_beats = bars * beats_per_bar
+        chord_dur = total_beats / len(chosen_progression)
+
+        if rhythm == "stab":
+            note_dur = min(0.5, chord_dur)
+        elif rhythm == "liquid":
+            note_dur = chord_dur * 1.1
+        else:  # sustained
+            note_dur = chord_dur
+
+        notes = []
+        chords = []
+        for i, degree in enumerate(chosen_progression):
+            raw_pitches = music_theory.diatonic_chord(tonic, mode, degree, octave, size=chord_size)
+            voiced_pitches = music_theory.voice_chord(raw_pitches, voicing=voicing)
+            start = i * chord_dur
+            for pitch in voiced_pitches:
+                notes.append({
+                    "pitch": pitch,
+                    "start_time": start,
+                    "duration": note_dur,
+                    "velocity": 90,
+                    "mute": False
+                })
+            chords.append({"degree": degree, "pitches": voiced_pitches, "start": start, "duration": chord_dur})
+
+        destination = _prepare_destination_clip(ableton, track_index, total_beats, clip_index, arrangement_start)
+        _write_notes(ableton, track_index, destination, notes)
+
+        return json.dumps({
+            "notes_written": len(notes),
+            "key": {"tonic": tonic, "mode": mode},
+            "progression": chosen_progression,
+            "chords": chords
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error generating chord progression: {str(e)}")
+        return f"Error generating chord progression: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("generate_drum_pattern")
+def generate_drum_pattern(
+    ctx: Context,
+    track_index: int,
+    bars: int,
+    clip_index: Optional[int] = None,
+    arrangement_start: Optional[float] = None,
+    genre: Optional[str] = None,
+    pattern: Optional[Dict[str, Any]] = None,
+    swing: float = 0.0,
+    humanize: float = 0.0,
+    user_prompt: str = ""
+) -> str:
+    """
+    Write a genre-style drum pattern as MIDI notes into a clip on a drum rack track.
+
+    Parameters:
+    - track_index: Index of the MIDI track (drum rack) to write to
+    - bars: Number of bars to repeat the pattern for
+    - clip_index: Session clip slot to write into (creates the clip if empty).
+      Pass exactly one of clip_index / arrangement_start.
+    - arrangement_start: Beat position in the Arrangement to create the clip at.
+    - genre: Genre key from music_theory.GENRES (e.g. "dnb_liquid", "house", "trap").
+      Defaults to the project genre set via set_project_key.
+    - pattern: Optional override, e.g. {"kick": [0, 2], "snare": [1, 3]} (beat
+      offsets within a bar) or {"hat": "rolls"} for continuous 8th-note rolls.
+      Merged on top of the genre's default pattern if both are given.
+    - swing: 0..1, delays off-beat 8th notes for a swung feel
+    - humanize: 0..1, randomizes note timing and velocity slightly
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        genre_key = genre or PROJECT.get("genre")
+        genre_def = music_theory.GENRES.get(genre_key, {}) if genre_key else {}
+
+        pattern_def = dict(genre_def.get("drums", {}))
+        if pattern:
+            pattern_def.update(pattern)
+        if not pattern_def:
+            raise ValueError("No drum pattern available — pass `pattern` or a known `genre`")
+
+        ableton = get_ableton_connection()
+        session_info = ableton.send_command("get_session_info")
+        beats_per_bar = session_info.get("signature_numerator", 4)
+        total_beats = bars * beats_per_bar
+
+        notes = []
+        piece_counts = {}
+        for piece, offsets in pattern_def.items():
+            pitch = music_theory.DRUM_PITCHES.get(piece, 36)
+            offset_list = [i * 0.5 for i in range(beats_per_bar * 2)] if offsets == "rolls" else offsets
+
+            for bar in range(bars):
+                bar_start = bar * beats_per_bar
+                for offset in offset_list:
+                    start_time = bar_start + offset
+                    velocity = 100
+
+                    if swing > 0 and (offset * 2) % 2 == 1:
+                        start_time += swing * 0.25
+                    if humanize > 0:
+                        start_time += random.uniform(-humanize, humanize) * 0.05
+                        velocity += int(random.uniform(-humanize, humanize) * 20)
+
+                    notes.append({
+                        "pitch": pitch,
+                        "start_time": max(0.0, start_time),
+                        "duration": 0.1,
+                        "velocity": max(1, min(127, velocity)),
+                        "mute": False
+                    })
+                    piece_counts[piece] = piece_counts.get(piece, 0) + 1
+
+        destination = _prepare_destination_clip(ableton, track_index, total_beats, clip_index, arrangement_start)
+        _write_notes(ableton, track_index, destination, notes)
+
+        return json.dumps({
+            "notes_written": len(notes),
+            "pieces": piece_counts,
+            "genre": genre_key
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error generating drum pattern: {str(e)}")
+        return f"Error generating drum pattern: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("apply_sound_design_preset")
+def apply_sound_design_preset(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    preset: str,
+    user_prompt: str = ""
+) -> str:
+    """
+    Apply a starter sound design patch to a device by preset name.
+
+    Parameters:
+    - track_index: Index of the track holding the device
+    - device_index: Index of the device on that track
+    - preset: Preset name from music_theory.SOUND_PRESETS (e.g. "reese_sub", "warm_pad")
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        preset_def = music_theory.SOUND_PRESETS.get(preset)
+        if preset_def is None:
+            raise ValueError(f"Unknown preset '{preset}'. Expected one of {sorted(music_theory.SOUND_PRESETS)}")
+
+        ableton = get_ableton_connection()
+        device_info = ableton.send_command("get_device_parameters", {
+            "track_index": track_index,
+            "device_index": device_index
+        })
+
+        available_names = {p["name"] for p in device_info["parameters"]}
+
+        to_apply = []
+        skipped = []
+        for name, value in preset_def["params"].items():
+            if name in available_names:
+                to_apply.append({"parameter_name": name, "value": value})
+            else:
+                skipped.append({"name": name, "reason": "parameter not found on device"})
+
+        applied = []
+        if to_apply:
+            result = ableton.send_command("set_multiple_device_parameters", {
+                "track_index": track_index,
+                "device_index": device_index,
+                "parameters": to_apply
+            })
+            applied = result.get("applied", to_apply)
+            for failure in result.get("errors", []):
+                skipped.append(failure)
+
+        return json.dumps({
+            "device_name": device_info.get("device_name"),
+            "preset": preset,
+            "applied": applied,
+            "skipped": skipped
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error applying sound design preset: {str(e)}")
+        return f"Error applying sound design preset: {str(e)}"
 
 
 # Main execution

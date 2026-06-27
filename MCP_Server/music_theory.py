@@ -167,6 +167,16 @@ GENRES = {
     },
 }
 
+DEFAULT_PROGRESSIONS = {
+    "major":             [1, 5, 6, 4],
+    "minor":             [1, 6, 3, 7],
+    "dorian":            [1, 4, 1, 5],
+    "mixolydian":        [1, 4, 5, 1],
+    "phrygian_dominant": [1, 2, 1, 7],
+    "harmonic_minor":    [1, 6, 7, 1],
+}
+DEFAULT_PROGRESSION_FALLBACK = [1, 4, 5, 1]
+
 DRUM_PITCHES = {
     "kick": 36,
     "snare": 38,
