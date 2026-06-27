@@ -245,7 +245,7 @@ class AbletonMCP(ControlSurface):
                                  # Arrangement view – must run on the main thread
                                  "switch_to_arrangement_view", "set_current_song_time",
                                  "duplicate_session_clip_to_arrangement", "create_arrangement_midi_clip",
-                                 "set_track_color", "set_locator"]:
+                                 "set_track_color", "set_locator", "add_notes_to_arrangement_clip"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -354,6 +354,12 @@ class AbletonMCP(ControlSurface):
                             time_val = params.get("time", 0.0)
                             name = params.get("name", "")
                             result = self._set_locator(time_val, name)
+                        elif command_type == "add_notes_to_arrangement_clip":
+                            track_index = params.get("track_index", 0)
+                            clip_index = params.get("clip_index", 0)
+                            notes = params.get("notes", [])
+                            result = self._add_notes_to_arrangement_clip(
+                                track_index, clip_index, notes)
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1123,6 +1129,46 @@ class AbletonMCP(ControlSurface):
             return result
         except Exception as e:
             self.log_message("Error getting arrangement clip notes: " + str(e))
+            raise
+
+    def _add_notes_to_arrangement_clip(self, track_index, clip_index, notes):
+        """Add MIDI notes to a clip placed in the Arrangement timeline.
+
+        clip_index refers to the position of the clip in track.arrangement_clips,
+        matching the "index" field returned by get_arrangement_clips.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+            arrangement_clips = list(track.arrangement_clips)
+
+            if clip_index < 0 or clip_index >= len(arrangement_clips):
+                raise IndexError("Clip index out of range")
+
+            clip = arrangement_clips[clip_index]
+
+            if not clip.is_midi_clip:
+                raise Exception("Clip is not a MIDI clip")
+
+            live_notes = []
+            for note in notes:
+                pitch = note.get("pitch", 60)
+                start_time = note.get("start_time", 0.0)
+                duration = note.get("duration", 0.25)
+                velocity = note.get("velocity", 100)
+                mute = note.get("mute", False)
+
+                live_notes.append((pitch, start_time, duration, velocity, mute))
+
+            clip.set_notes(tuple(live_notes))
+
+            return {
+                "note_count": len(notes)
+            }
+        except Exception as e:
+            self.log_message("Error adding notes to arrangement clip: " + str(e))
             raise
 
     def _create_arrangement_midi_clip(self, track_index, start_time, length):
