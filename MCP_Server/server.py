@@ -1820,6 +1820,209 @@ def generate_bassline(
         return f"Error generating bassline: {str(e)}"
 
 
+@mcp.tool()
+@rich_telemetry_tool("scaffold_track")
+def scaffold_track(
+    ctx: Context,
+    genre: str,
+    tonic: str,
+    mode: Optional[str] = None,
+    progression: Optional[List[int]] = None,
+    structure: Optional[List[Dict[str, Any]]] = None,
+    elements: Optional[List[str]] = None,
+    start_bar: int = 1,
+    dry_run: bool = False,
+    user_prompt: str = ""
+) -> str:
+    """
+    Build a playable musical base from an empty (or clean) set in one call:
+    key + tempo, section markers, and chords/bass/drums for the main section.
+
+    Does NOT create groups, load instruments, or set a loop — those still need
+    to be done by hand in Live (see the `note` field in the result). Tracks are
+    created plain/named/colored so they're easy to find and drag instruments onto.
+
+    Parameters:
+    - genre: One of music_theory.GENRES (e.g. "dnb_liquid", "house", "trap") —
+      drives tempo, default mode, and bass/drum style.
+    - tonic: Root note, e.g. "Bb", "F"
+    - mode: Scale/mode override. Defaults to the genre's default_mode.
+    - progression: Scale degrees for the chord progression, e.g. [1, 6, 4, 5].
+      Defaults to an idiomatic progression for the mode.
+    - structure: Song structure as [{"name": str, "bars": int}, ...], each
+      entry's "bars" being that section's length (not an absolute position).
+      Defaults to intro(8)/build(8)/drop(16)/break(8). Chords/bass/drums are
+      generated across whichever section is named "drop" (or the first one).
+    - elements: Which parts to build: any of "drums", "bass", "chords", "pad",
+      "fx". Defaults to all of them.
+    - start_bar: Bar number the structure starts at (1 = top of the arrangement)
+    - dry_run: If True, returns the plan without creating/modifying anything in Live
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        chosen_elements = elements or ["drums", "bass", "chords", "pad", "fx"]
+        chosen_structure = structure or music_theory.DEFAULT_STRUCTURE
+
+        genre_def = music_theory.GENRES.get(genre)
+        if genre_def is None:
+            raise ValueError(f"Unknown genre '{genre}'. Expected one of {sorted(music_theory.GENRES)}")
+        chosen_mode = mode or genre_def.get("default_mode", "minor")
+        music_theory.validate_tonic_mode(tonic, chosen_mode)
+
+        section_starts = {}
+        markers = []
+        cursor = start_bar
+        for section in chosen_structure:
+            section_starts[section["name"]] = cursor
+            markers.append({"name": section["name"], "bar": cursor})
+            cursor += section["bars"]
+
+        main_section = next(
+            (s for s in chosen_structure if s["name"] == "drop"), chosen_structure[0]
+        )
+        main_start_bar = section_starts[main_section["name"]]
+        main_bars = main_section["bars"]
+
+        plan = {
+            "key": {"tonic": tonic, "mode": chosen_mode},
+            "tempo": genre_def.get("tempo"),
+            "genre": genre,
+            "markers": markers,
+            "main_section": {"name": main_section["name"], "start_bar": main_start_bar, "bars": main_bars},
+            "tracks_to_create": [e for e in chosen_elements if e in ("drums", "bass", "chords", "pad", "fx")],
+            "note": (
+                "Track grouping, instrument loading, and arrangement looping are not "
+                "automated yet — group the tracks, load instruments on Bass/Harmony/Pad, "
+                "and set the loop range by hand in Live."
+            ),
+        }
+
+        if dry_run:
+            return json.dumps({"dry_run": True, "plan": plan}, indent=2)
+
+        set_project_key(ctx, tonic=tonic, mode=chosen_mode, tempo=genre_def.get("tempo"), genre=genre, user_prompt=user_prompt)
+
+        ableton = get_ableton_connection()
+        session_info = ableton.send_command("get_session_info")
+        beats_per_bar = session_info.get("signature_numerator", 4)
+        main_start_beats = (main_start_bar - 1) * beats_per_bar
+
+        create_section_markers(ctx, sections=markers, user_prompt=user_prompt)
+
+        tracks_created = []
+        harmony_track_index = None
+
+        if "chords" in chosen_elements:
+            result = ableton.send_command("create_midi_track", {"index": -1})
+            harmony_track_index = result["index"]
+            ableton.send_command("set_track_name", {"track_index": harmony_track_index, "name": "Harmony"})
+            ableton.send_command("set_track_color", {
+                "track_index": harmony_track_index, "color": music_theory.TRACK_COLORS["harmony"]
+            })
+            tracks_created.append({"role": "chords", "track_index": harmony_track_index, "name": "Harmony"})
+
+            generate_chord_progression(
+                ctx,
+                track_index=harmony_track_index,
+                bars=main_bars,
+                arrangement_start=main_start_beats,
+                progression=progression,
+                key={"tonic": tonic, "mode": chosen_mode},
+                user_prompt=user_prompt
+            )
+
+        if "bass" in chosen_elements:
+            result = ableton.send_command("create_midi_track", {"index": -1})
+            bass_track_index = result["index"]
+            ableton.send_command("set_track_name", {"track_index": bass_track_index, "name": "Bass"})
+            ableton.send_command("set_track_color", {
+                "track_index": bass_track_index, "color": music_theory.TRACK_COLORS["bass"]
+            })
+            tracks_created.append({"role": "bass", "track_index": bass_track_index, "name": "Bass"})
+
+            if harmony_track_index is not None:
+                harmony_clips = ableton.send_command(
+                    "get_arrangement_clips", {"track_index": harmony_track_index}
+                )["clips"]
+                harmony_clip_index = next(
+                    c["index"] for c in harmony_clips
+                    if abs(c["start_time"] - main_start_beats) < 1e-6
+                )
+                generate_bassline(
+                    ctx,
+                    track_index=bass_track_index,
+                    bars=main_bars,
+                    arrangement_start=main_start_beats,
+                    follow_track_index=harmony_track_index,
+                    follow_arrangement_clip_index=harmony_clip_index,
+                    style=genre_def.get("bass_style", "sustained"),
+                    key={"tonic": tonic, "mode": chosen_mode},
+                    user_prompt=user_prompt
+                )
+            else:
+                generate_bassline(
+                    ctx,
+                    track_index=bass_track_index,
+                    bars=main_bars,
+                    arrangement_start=main_start_beats,
+                    progression=progression,
+                    style=genre_def.get("bass_style", "sustained"),
+                    key={"tonic": tonic, "mode": chosen_mode},
+                    user_prompt=user_prompt
+                )
+
+        if "drums" in chosen_elements:
+            result = ableton.send_command("create_midi_track", {"index": -1})
+            drums_track_index = result["index"]
+            ableton.send_command("set_track_name", {"track_index": drums_track_index, "name": "Drums"})
+            ableton.send_command("set_track_color", {
+                "track_index": drums_track_index, "color": music_theory.TRACK_COLORS["drums"]
+            })
+            tracks_created.append({"role": "drums", "track_index": drums_track_index, "name": "Drums"})
+
+            generate_drum_pattern(
+                ctx,
+                track_index=drums_track_index,
+                bars=main_bars,
+                arrangement_start=main_start_beats,
+                genre=genre,
+                user_prompt=user_prompt
+            )
+
+        if "pad" in chosen_elements:
+            result = ableton.send_command("create_midi_track", {"index": -1})
+            pad_track_index = result["index"]
+            ableton.send_command("set_track_name", {"track_index": pad_track_index, "name": "Pad"})
+            ableton.send_command("set_track_color", {
+                "track_index": pad_track_index, "color": music_theory.TRACK_COLORS["pad"]
+            })
+            tracks_created.append({"role": "pad", "track_index": pad_track_index, "name": "Pad"})
+
+        if "fx" in chosen_elements:
+            result = ableton.send_command("create_midi_track", {"index": -1})
+            fx_track_index = result["index"]
+            ableton.send_command("set_track_name", {"track_index": fx_track_index, "name": "FX"})
+            ableton.send_command("set_track_color", {
+                "track_index": fx_track_index, "color": music_theory.TRACK_COLORS["fx"]
+            })
+            tracks_created.append({"role": "fx", "track_index": fx_track_index, "name": "FX"})
+
+        ableton.send_command("switch_to_arrangement_view")
+
+        return json.dumps({
+            "dry_run": False,
+            "tracks_created": tracks_created,
+            "markers": markers,
+            "key": {"tonic": tonic, "mode": chosen_mode},
+            "tempo": genre_def.get("tempo"),
+            "main_section": plan["main_section"],
+            "note": plan["note"]
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error scaffolding track: {str(e)}")
+        return f"Error scaffolding track: {str(e)}"
+
+
 # Main execution
 def main():
     """Run the MCP server"""

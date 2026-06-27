@@ -172,6 +172,21 @@ GENRES = {
     },
 }
 
+DEFAULT_STRUCTURE = [
+    {"name": "intro", "bars": 8},
+    {"name": "build", "bars": 8},
+    {"name": "drop", "bars": 16},
+    {"name": "break", "bars": 8},
+]
+
+TRACK_COLORS = {
+    "drums": 0xCC3333,
+    "bass": 0xCC8800,
+    "harmony": 0x3366CC,
+    "pad": 0x9933CC,
+    "fx": 0x33CC99,
+}
+
 DEFAULT_PROGRESSIONS = {
     "major":             [1, 5, 6, 4],
     "minor":             [1, 6, 3, 7],
