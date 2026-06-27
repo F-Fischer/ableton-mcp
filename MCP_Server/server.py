@@ -1660,6 +1660,166 @@ def apply_sound_design_preset(
         return f"Error applying sound design preset: {str(e)}"
 
 
+def _deduce_roots_from_track(
+    ableton,
+    follow_track_index: int,
+    follow_clip_index: Optional[int],
+    follow_arrangement_clip_index: Optional[int],
+    bars: int,
+    beats_per_bar: float,
+    octave: int
+) -> List[int]:
+    """Read notes from another track's clip and deduce one bass root per bar
+    (the lowest note sounding in that bar), placed in the requested octave.
+    """
+    if (follow_clip_index is None) == (follow_arrangement_clip_index is None):
+        raise ValueError("Pass exactly one of follow_clip_index or follow_arrangement_clip_index")
+
+    if follow_clip_index is not None:
+        notes = ableton.send_command("get_clip_notes", {
+            "track_index": follow_track_index,
+            "clip_index": follow_clip_index
+        })["notes"]
+    else:
+        notes = ableton.send_command("get_arrangement_clip_notes", {
+            "track_index": follow_track_index,
+            "clip_index": follow_arrangement_clip_index
+        })["notes"]
+
+    roots = []
+    last_pitch_class = 0
+    for bar in range(bars):
+        window_start = bar * beats_per_bar
+        window_end = window_start + beats_per_bar
+        in_window = [n for n in notes if window_start <= n["start_time"] < window_end]
+        if in_window:
+            last_pitch_class = min(n["pitch"] for n in in_window) % 12
+        roots.append(music_theory.pitch_in_octave(last_pitch_class, octave))
+
+    return roots
+
+
+def _bassline_segment_notes(style: str, segment_dur: float, root_pitch: int, continuous: bool) -> List[Dict[str, float]]:
+    """Build the (relative) note timings for one segment of a bassline, per style."""
+    if style == "rolling_sub":
+        step = 0.5
+        count = max(1, int(round(segment_dur / step)))
+        events = [{"start": i * step} for i in range(count)]
+    elif style == "offbeat":
+        step = 0.5
+        count = max(1, int(round(segment_dur / step)))
+        events = [{"start": i * step} for i in range(count) if i % 2 == 1]
+        if not events:
+            events = [{"start": 0.0}]
+    else:  # "reese_growl", "808_glide", "sustained", and any other fallback
+        events = [{"start": 0.0}]
+
+    for i, event in enumerate(events):
+        next_start = events[i + 1]["start"] if i + 1 < len(events) else segment_dur
+        event["duration"] = next_start - event["start"] if continuous else min(0.5, next_start - event["start"])
+        event["pitch"] = root_pitch
+
+    return events
+
+
+@mcp.tool()
+@rich_telemetry_tool("generate_bassline")
+def generate_bassline(
+    ctx: Context,
+    track_index: int,
+    bars: int,
+    clip_index: Optional[int] = None,
+    arrangement_start: Optional[float] = None,
+    follow_track_index: Optional[int] = None,
+    follow_clip_index: Optional[int] = None,
+    follow_arrangement_clip_index: Optional[int] = None,
+    progression: Optional[List[int]] = None,
+    style: str = "rolling_sub",
+    octave: int = 1,
+    continuous: bool = True,
+    key: Optional[Dict[str, str]] = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Write a bassline that follows the harmony of another track's clip, or a
+    given chord progression, in a genre-appropriate style.
+
+    Parameters:
+    - track_index: Index of the MIDI track to write the bassline to
+    - bars: Length of the bassline in bars
+    - clip_index: Session clip slot to write into (creates the clip if empty).
+      Pass exactly one of clip_index / arrangement_start.
+    - arrangement_start: Beat position in the Arrangement to create the clip at.
+    - follow_track_index: Track to read harmony from. If given, the root note
+      for each bar is deduced from the lowest note sounding in that bar.
+      Pass exactly one of follow_clip_index (Session) / follow_arrangement_clip_index
+      (Arrangement, index per get_arrangement_clips) alongside it.
+    - progression: Alternative to follow_track_index — scale degrees per segment,
+      e.g. [1, 6, 4, 5]. Ignored if follow_track_index is given.
+    - style: "rolling_sub", "reese_growl", "offbeat", "808_glide", or "sustained"
+    - octave: Register for the bass notes (Ableton convention, C3 == MIDI 60)
+    - continuous: If True, notes are stretched so there are no silent gaps
+    - key: Optional {"tonic": ..., "mode": ...} override. Defaults to the project key.
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        session_info = ableton.send_command("get_session_info")
+        beats_per_bar = session_info.get("signature_numerator", 4)
+        total_beats = bars * beats_per_bar
+
+        if follow_track_index is not None:
+            roots = _deduce_roots_from_track(
+                ableton, follow_track_index, follow_clip_index,
+                follow_arrangement_clip_index, bars, beats_per_bar, octave
+            )
+            segment_dur = beats_per_bar
+        else:
+            tonic, mode = _resolve_key(key)
+            chosen_progression = progression or music_theory.DEFAULT_PROGRESSIONS.get(
+                mode, music_theory.DEFAULT_PROGRESSION_FALLBACK
+            )
+            segment_dur = total_beats / len(chosen_progression)
+            roots = [
+                music_theory.pitch_in_octave(
+                    music_theory.degree_to_pitch(tonic, mode, degree, octave) % 12, octave
+                )
+                for degree in chosen_progression
+            ]
+
+        notes = []
+        root_log = []
+        for i, root_pitch in enumerate(roots):
+            segment_start = i * segment_dur
+            for event in _bassline_segment_notes(style, segment_dur, root_pitch, continuous):
+                notes.append({
+                    "pitch": event["pitch"],
+                    "start_time": segment_start + event["start"],
+                    "duration": event["duration"],
+                    "velocity": 100,
+                    "mute": False
+                })
+            root_log.append({"beat": segment_start, "pitch": root_pitch})
+
+        destination = _prepare_destination_clip(ableton, track_index, total_beats, clip_index, arrangement_start)
+        _write_notes(ableton, track_index, destination, notes)
+
+        gapless = continuous and all(
+            abs(notes[i]["start_time"] + notes[i]["duration"] - notes[i + 1]["start_time"]) < 1e-6
+            for i in range(len(notes) - 1)
+        )
+
+        return json.dumps({
+            "notes_written": len(notes),
+            "style": style,
+            "roots": root_log,
+            "gapless": gapless
+        }, indent=2)
+    except Exception as e:
+        logger.error(f"Error generating bassline: {str(e)}")
+        return f"Error generating bassline: {str(e)}"
+
+
 # Main execution
 def main():
     """Run the MCP server"""

@@ -67,6 +67,11 @@ def snap_to_scale(pitch: int, tonic: str, mode: str, direction: str = "nearest")
     return pitch
 
 
+def pitch_in_octave(pitch_class: int, octave: int) -> int:
+    """Place a pitch class (0..11) in a given Ableton octave (C{octave} == MIDI (octave+2)*12)."""
+    return (octave + 2) * 12 + (pitch_class % 12)
+
+
 def degree_to_pitch(tonic: str, mode: str, degree: int, octave: int) -> int:
     """Diatonic scale degree (1-indexed, wraps past 7) to a MIDI pitch in the given octave.
 
